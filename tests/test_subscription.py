@@ -69,7 +69,11 @@ async def test_subscription_text_message(
     async def _handler(data: Any) -> None:
         _handled.append(data)
 
-    await api_client.subscribe(_handler)
+    with pytest.raises(
+        TraccarConnectionException,
+        match="WebSocket connection closed unexpectedly",
+    ):
+        await api_client.subscribe(_handler)
     assert _handled == _expected_handled
 
 
@@ -128,7 +132,11 @@ async def test_subscription_unknown_type(
 
     assert f"Unexpected message type {message.type.name}" not in caplog.text
 
-    await api_client.subscribe(_handler)
+    with pytest.raises(
+        TraccarConnectionException,
+        match="WebSocket connection closed unexpectedly",
+    ):
+        await api_client.subscribe(_handler)
 
     assert len(_handled) == 0
     assert f"Unexpected message type {message.type.name}" in caplog.text
@@ -146,9 +154,39 @@ async def test_subscription_bad_handler(
     async def _handler(_: Any) -> NoReturn:
         raise ValueError("Bad handler")
 
-    await api_client.subscribe(_handler)
+    with pytest.raises(
+        TraccarConnectionException,
+        match="WebSocket connection closed unexpectedly",
+    ):
+        await api_client.subscribe(_handler)
 
     assert "Exception while handling message: ValueError(Bad handler)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_subscription_silent_close(
+    api_client: ApiClient,
+    mock_ws_messages: WSMessageHandler,
+) -> None:
+    """Test that a silent WebSocket close raises TraccarConnectionException.
+
+    When the server closes the connection without sending a CLOSE frame
+    (e.g. during a restart), aiohttp's async iterator exits without raising.
+    The client must still surface this as a connection exception.
+    """
+    assert api_client.subscription_status == SubscriptionStatus.DISCONNECTED
+    assert len(mock_ws_messages.messages) == 0
+
+    async def _handler(_: Any) -> None:
+        pass
+
+    with pytest.raises(
+        TraccarConnectionException,
+        match="WebSocket connection closed unexpectedly",
+    ):
+        await api_client.subscribe(_handler)
+
+    assert api_client.subscription_status == SubscriptionStatus.ERROR
 
 
 @pytest.mark.parametrize(
@@ -204,5 +242,32 @@ async def test_subscription_cancelation(api_client: ApiClient) -> None:
         "aiohttp.ClientSession.ws_connect", side_effect=asyncio.CancelledError("boom")
     ):
         await api_client.subscribe(None)
+
+    assert api_client.subscription_status == SubscriptionStatus.DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_subscription_unsubscribe_graceful(
+    api_client: ApiClient,
+    mock_ws_messages: WSMessageHandler,
+) -> None:
+    """Test cancellation-based unsubscription is handled gracefully."""
+    handler_block_seconds = 30
+    started = asyncio.Event()
+    mock_ws_messages.add(WSMessage(messagetype=WSMsgType.TEXT, json={"devices": []}))
+
+    async def _handler(_message: Any) -> None:
+        started.set()
+        await asyncio.sleep(handler_block_seconds)
+
+    subscribe_task = asyncio.create_task(api_client.subscribe(_handler))
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    subscribe_task.cancel()
+    try:
+        await asyncio.wait_for(subscribe_task, timeout=1)
+    except asyncio.CancelledError:
+        pytest.fail("Cancellation should be handled gracefully by subscribe()")
 
     assert api_client.subscription_status == SubscriptionStatus.DISCONNECTED
